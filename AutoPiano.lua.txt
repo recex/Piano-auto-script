@@ -1,0 +1,746 @@
+--[[
+    ╔══════════════════════════════════════════════════╗
+    ║  🎹 XENOPIANO V2 — by Recex / Xenoryx           ║
+    ║  Engine timestamp-based · Error margin · UI V2  ║
+    ╚══════════════════════════════════════════════════╝
+
+    ENGINE: ao invés de task.wait() sequencial, cada nota tem
+    um timestamp absoluto (em segundos desde o início da música).
+    O scheduler acorda na hora certa de cada nota e pressiona a
+    tecla — acordes são perfeitamente sincronizados.
+
+    FORMATO DE SONG:
+    {
+        bpm = 120,          -- opcional, usado só como referência
+        notes = {
+            { t=0.000, k="q",        l=0.08 },   -- t=tempo(s), k=tecla, l=length(s)
+            { t=0.000, k="e",        l=0.08 },   -- mesmo t = acorde
+            { t=0.500, k="w",        l=0.08 },
+            { t=0.500, k={"q","e"},  l=0.10 },   -- k pode ser tabela p/ acorde inline
+        }
+    }
+]]
+
+-- ============================================================
+-- SERVICES
+-- ============================================================
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local VirtualUser  = game:GetService("VirtualUser")
+local RunService   = game:GetService("RunService")
+local LocalPlayer  = Players.LocalPlayer
+local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ============================================================
+-- ESTADO
+-- ============================================================
+local XP = {
+    Playing     = false,
+    StopFlag    = false,
+    ErrorMargin = 0,       -- 0-100, igual ao TALENTLESS
+    NoteRand    = true,    -- randomiza length de cada nota
+    ActiveKeys  = {},
+    Buttons     = {},
+    StatusLbl   = nil,
+    NoteLbl     = nil,
+    ErrLbl      = nil,
+}
+
+-- ============================================================
+-- ENGINE — TIMESTAMP BASED
+-- ============================================================
+
+-- Pressiona uma tecla por `length` segundos
+local function FireKey(key, length)
+    if XP.StopFlag then return end
+    pcall(function()
+        VirtualUser:SetKeyDown(key)
+        XP.ActiveKeys[key] = true
+    end)
+    task.delay(length, function()
+        pcall(function()
+            VirtualUser:SetKeyUp(key)
+            XP.ActiveKeys[key] = nil
+        end)
+    end)
+    -- anima label
+    if XP.NoteLbl then
+        XP.NoteLbl.Text = key
+        TweenService:Create(XP.NoteLbl,
+            TweenInfo.new(0.04), {TextColor3=Color3.fromRGB(80,255,140)}):Play()
+        task.delay(0.15, function()
+            if XP.NoteLbl then
+                TweenService:Create(XP.NoteLbl,
+                    TweenInfo.new(0.2), {TextColor3=Color3.fromRGB(155,155,195)}):Play()
+            end
+        end)
+    end
+end
+
+local function ReleaseAll()
+    for k in pairs(XP.ActiveKeys) do
+        pcall(VirtualUser.SetKeyUp, VirtualUser, k)
+    end
+    XP.ActiveKeys = {}
+end
+
+-- Scheduler principal
+-- song.notes = lista de { t=float, k=string|table, l=float }
+local function PlaySong(song)
+    if XP.Playing then
+        XP.StopFlag = true
+        task.wait(0.2)
+    end
+    XP.Playing  = true
+    XP.StopFlag = false
+    VirtualUser:CaptureController()
+
+    local notes    = song.notes
+    local startTime = os.clock()
+    local i         = 1
+    local totalNotes = #notes
+
+    -- calcula erro máximo em segundos (0–100 → 0s–0.08s)
+    local function errDelta()
+        if XP.ErrorMargin == 0 then return 0 end
+        local maxErr = (XP.ErrorMargin / 100) * 0.08
+        return (math.random() * 2 - 1) * maxErr
+    end
+
+    -- length randomization (±10ms quando ativo)
+    local function randLen(l)
+        if not XP.NoteRand then return l end
+        return l + (math.random() * 2 - 1) * 0.010
+    end
+
+    while i <= totalNotes do
+        if XP.StopFlag then break end
+
+        local note    = notes[i]
+        local target  = note.t + errDelta()
+        local elapsed = os.clock() - startTime
+
+        if target > elapsed then
+            -- espera precisa usando RunService ao invés de task.wait granular
+            local remaining = target - elapsed
+            if remaining > 0.001 then
+                task.wait(remaining)
+            end
+        end
+
+        if XP.StopFlag then break end
+
+        -- dispara tecla(s)
+        local keys = type(note.k) == "table" and note.k or {note.k}
+        local len  = randLen(note.l or 0.08)
+        for _, k in ipairs(keys) do
+            FireKey(k, len)
+        end
+
+        -- status
+        if XP.StatusLbl then
+            XP.StatusLbl.Text = string.format("▶  %d / %d", i, totalNotes)
+        end
+
+        i = i + 1
+    end
+
+    ReleaseAll()
+    XP.Playing = false
+    if XP.NoteLbl  then XP.NoteLbl.Text  = "—" end
+    if XP.StatusLbl then XP.StatusLbl.Text = "✓ Concluído" end
+end
+
+-- ============================================================
+-- PARSER DE SHEET (formato texto → tabela de notes)
+-- Aceita formato Virtual Piano: "q w e [qe] t y"
+-- com BPM: "bpm:120 q w e [qe]"
+-- ============================================================
+local VP_NOTE_LEN = 0.08  -- default note length em segundos
+
+local function ParseSheet(sheet, bpmOverride)
+    local bpm   = bpmOverride or 120
+    local step  = 60 / bpm / 2   -- cada token = 1/2 beat
+    local notes = {}
+    local t     = 0
+
+    -- pega bpm inline: "bpm:140 q w e ..."
+    sheet = sheet:gsub("bpm:(%d+)", function(b)
+        bpm  = tonumber(b)
+        step = 60 / bpm / 2
+        return ""
+    end)
+
+    for token in sheet:gmatch("%S+") do
+        if token == "|" then
+            t = t + step * 2   -- pausa de compasso
+        elseif token == "-" or token == "_" then
+            t = t + step       -- pausa simples
+        elseif token:sub(1,1) == "[" and token:sub(-1) == "]" then
+            -- acorde: [qet]
+            local inner = token:sub(2,-2)
+            local chord = {}
+            for c in inner:gmatch(".") do table.insert(chord, c) end
+            if #chord > 0 then
+                table.insert(notes, { t=t, k=chord, l=VP_NOTE_LEN })
+                t = t + step
+            end
+        else
+            -- sequência de teclas simples: qwe
+            local first = true
+            for c in token:gmatch(".") do
+                if first then
+                    table.insert(notes, { t=t, k=c, l=VP_NOTE_LEN })
+                    t = t + step
+                    first = false
+                else
+                    -- notas consecutivas no mesmo token ficam grudadas
+                    table.insert(notes, { t=t, k=c, l=VP_NOTE_LEN })
+                    t = t + step * 0.5
+                end
+            end
+        end
+    end
+
+    return { bpm=bpm, notes=notes }
+end
+
+-- ============================================================
+-- BIBLIOTECA DE MÚSICAS (formato timestamp nativo)
+-- Convertidas manualmente com BPM correto
+-- ============================================================
+--
+-- Como gerar: pega uma sheet de Virtual Piano (ex: "q w [et] r")
+-- e chama ParseSheet(sheet, bpm). Aqui já tá pré-convertido.
+--
+local RawSongs = {
+    ["🎮 Games"] = {
+
+        ["Megalovania"] = {
+            bpm=200,
+            sheet="t t [yt] - t [et] - t [wt] - t [qt] - t [yt] - t [et] - t [wt] - t [qt] - t"
+        },
+
+        ["Giorno's Theme"] = {
+            bpm=76,
+            sheet="[qe] [qe] [qe] [qe] | r r | [er] [er] | [wt] [wt] | [et] [et] | [wr] [wr]"
+        },
+
+        ["Undertale - Ruins"] = {
+            bpm=100,
+            sheet="[ce] [ce] [df] [df] | [ce] [ce] [df] [df] | [BD] [BD] [ce] [ce] | [AC] [AC] [BD] [BD]"
+        },
+
+        ["Tetris Theme"] = {
+            bpm=150,
+            sheet="E B C D C B A _ A C E D C B B _ C D E _ C _ A _ A _ _ _ D F A G F E _ C E D C B B C D E C _ A"
+        },
+
+        ["Minecraft Sweden"] = {
+            bpm=90,
+            sheet="[qt] [qt] [wr] [wr] | [qe] [qe] [wr] _ | [qt] [qt] [wr] [er] | [qe] _ _ _"
+        },
+    },
+
+    ["🎹 Clássicas"] = {
+
+        ["Fur Elise"] = {
+            bpm=130,
+            sheet="0 Q 0 Q 0 p i o u | [uio] _ u [eit] _ e | [eou] _ e [0Qu] _ 0 | 0 Q 0 Q 0 p i o u [uio] _ u [eit] _ e [eoi] p o i _ _"
+        },
+
+        ["Moonlight Sonata"] = {
+            bpm=60,
+            sheet="[0pu] [0pu] [0pu] | [Qpu] [Qpu] [Qpu] | [Wou] [Wou] [Wou] | [0iu] [0iu] [0iu] | [9ou] [9ou] [9ou] | [0pu] [0pu] [0pu]"
+        },
+
+        ["Canon in D"] = {
+            bpm=100,
+            sheet="d _ a _ b _ f _ g _ d _ g _ a _ d _ a _ b _ f _ g _ d _ g _ a _ f _ d _ f _ a _ g _ e _ g _ b _ a _ f _ a _ c _ b _ g _ b _ d"
+        },
+
+        ["Gymnopedie No.1"] = {
+            bpm=52,
+            sheet="[fac]*3 | [gbd]*3 | [eac]*3 | [fac]*3 | [dfa]*3 | [egb]*3 | [cea]*3 | [fac]*3"
+        },
+
+        ["Clair de Lune (intro)"] = {
+            bpm=54,
+            sheet="[pui] [pui] [oue] [oue] | [iyt] [iyt] [uyr] [uyr] | [pui] [pui] [oue] [oue] | [iyt]*4"
+        },
+
+        ["Comptine d'ete"] = {
+            bpm=110,
+            sheet="e t e t e t e t e t e t e t e t | e y e y e y e y e y e y e y e y | r t r t r t r t r t r t r t r t | e t e t e t e t e t e t e t e t"
+        },
+    },
+
+    ["🎵 Pop / Viral"] = {
+
+        ["Rush E"] = {
+            bpm=220,
+            sheet="e e e e [we] [we] [we] [we] [qe] [qe] [qe] [qe] e e e e [ey] [ey] [ey] [ey] [wy] [wy] [wy] [wy] [qy] [qy] [qy] [qy] e e e e [we] [we] [we] [we] [qe] [qe] [qe] [qe] [ei] [ei] [ei] [ei]"
+        },
+
+        ["Golden Hour"] = {
+            bpm=95,
+            sheet="e r t y u | e r t y u | i u y t r | e r t y u | u y t r e | u y t r e | [eu] [ry] [ty] [yr] [ue] | e r t y u"
+        },
+
+        ["A Thousand Years"] = {
+            bpm=92,
+            sheet="[pui] _ [oui] _ | [iue] _ [uyt] _ | [pui] _ [oui] _ | [iue] _ [oui] _"
+        },
+
+        ["All of Me"] = {
+            bpm=63,
+            sheet="f g a f | g a p f | g a p f | e f g e | f g a e | f g a f | d e f d | e f g e"
+        },
+
+        ["Coffin Dance"] = {
+            bpm=120,
+            sheet="0 _ 0 p u _ | 9 _ 9 o i _ | 8 _ 8 i u _ | 7 8 9 0 p | 0 _ 0 p u _ | 9 _ 9 o i _ | 8 9 7 8 9 | 8 _ _ _"
+        },
+
+        ["River Flows in You"] = {
+            bpm=76,
+            sheet="[ue] [ue] t t | [ue] [ue] t t | [yr] [yr] e e | [ti] [ti] [eo] [eo] | [ue] [ue] t t | [ue] [ue] t t | [yr] [yr] e e | [eu] [eu] [eu] [eu]"
+        },
+
+        ["My Heart Will Go On"] = {
+            bpm=80,
+            sheet="0 _ 0 p u _ | 9 _ 9 0 p _ | o _ o i u _ | 0 _ p _ p 0 | 0 _ 0 p u _ | 9 _ 9 0 p _ | o _ i _ u _ | i _ _ _"
+        },
+
+        ["Bohemian Rhapsody"] = {
+            bpm=72,
+            sheet="[ryu] [ryu] [eyt] [eyt] | [wyr] [wyr] [ert] [ert] | [qyr] [qyr] [wrt] [wrt] | [eyt] [eyt] [eyt] [eyt]"
+        },
+
+        ["Interstellar"] = {
+            bpm=54,
+            sheet="p _ _ _ | o _ _ _ | [pu] _ _ _ | [pe] _ _ _ | [oi] _ _ _ | [ot] _ _ _ | p _ _ _"
+        },
+
+        ["Believer"] = {
+            bpm=128,
+            sheet="e e e e | t t t t | r r r r | w w w w | e e [et] e | t t [ti] t | r r [ru] r | w _ _ _"
+        },
+
+        ["Despacito (riff)"] = {
+            bpm=90,
+            sheet="r e w e | r e w q | 0 q w e | r _ _ _ | r e w e | r e w q | 0 q w q | 0 _ _ _"
+        },
+
+        ["Someone You Loved"] = {
+            bpm=76,
+            sheet="[eit] [eit] [wir] [wir] | [qie] [qie] [wir] _ | [eit] [eit] [wor] [eou] | [qie] _ _ _"
+        },
+
+        ["Starboy"] = {
+            bpm=94,
+            sheet="t _ r _ e _ r _ | t _ r _ e _ _ _ | t _ r _ e _ r _ | w _ e _ q _ _ _"
+        },
+    },
+
+    ["🎄 Especiais"] = {
+
+        ["Happy Birthday"] = {
+            bpm=100,
+            sheet="t _ t u t p o | t _ t u t i u | t _ t p o e r | r _ q e u t"
+        },
+
+        ["Jingle Bells"] = {
+            bpm=140,
+            sheet="o o o _ | o o o _ | o u e q w | i _ _ _ | i i i i | i o u u | o i u q | e _ _ _ | e e e e e | o o o o | e e o i | u _ _ _"
+        },
+
+        ["We Wish You Merry Christmas"] = {
+            bpm=120,
+            sheet="t | p p q w | e _ e | f f e q | w _ _ | r p q w | e _ t | o o i w | u _ _ | r _ r _ | i _ q w | e _ e | f e q | w _ t | o o i u | p _ _"
+        },
+    },
+}
+
+-- Converte todas as songs de sheet → tabela de notes
+local Songs = {}
+for cat, list in pairs(RawSongs) do
+    Songs[cat] = {}
+    for name, data in pairs(list) do
+        if data.notes then
+            -- já no formato nativo
+            Songs[cat][name] = data
+        elseif data.sheet then
+            Songs[cat][name] = ParseSheet(data.sheet, data.bpm)
+            Songs[cat][name].bpm = data.bpm
+        end
+    end
+end
+
+local AllSongs = {}
+for _, cat in pairs(Songs) do
+    for name, song in pairs(cat) do AllSongs[name] = song end
+end
+
+-- ============================================================
+-- UI HELPERS
+-- ============================================================
+local C = Color3.fromRGB
+local function Corner(p,r) local c=Instance.new("UICorner");c.CornerRadius=UDim.new(0,r or 8);c.Parent=p end
+local function Stroke(p,col,t) local s=Instance.new("UIStroke");s.Color=col or C(55,50,85);s.Thickness=t or 1;s.Parent=p end
+local function Pad(p,l,r,top,b) local u=Instance.new("UIPadding");u.PaddingLeft=UDim.new(0,l);u.PaddingRight=UDim.new(0,r or l);u.PaddingTop=UDim.new(0,top or 0);u.PaddingBottom=UDim.new(0,b or 0);u.Parent=p end
+
+local function New(cls,props,parent)
+    local o=Instance.new(cls)
+    for k,v in pairs(props) do pcall(function() o[k]=v end) end
+    if parent then o.Parent=parent end
+    return o
+end
+
+local function Tween(obj,props,t)
+    TweenService:Create(obj,TweenInfo.new(t or 0.14,Enum.EasingStyle.Quad),props):Play()
+end
+
+local function Btn(parent,text,bg,props)
+    local b=New("TextButton",{
+        BackgroundColor3=bg or C(36,34,54),
+        TextColor3=C(210,205,255),Text=text,
+        Font=Enum.Font.GothamBold,TextSize=13,
+        AutoButtonColor=false,BorderSizePixel=0,
+    },parent)
+    if props then for k,v in pairs(props) do pcall(function() b[k]=v end) end end
+    Corner(b,props and props._r or 8)
+    local n=b.BackgroundColor3
+    local h=C(math.min(n.R*255+24,255),math.min(n.G*255+22,255),math.min(n.B*255+30,255))
+    b.MouseEnter:Connect(function() Tween(b,{BackgroundColor3=h}) end)
+    b.MouseLeave:Connect(function() Tween(b,{BackgroundColor3=n}) end)
+    return b
+end
+
+-- ============================================================
+-- BUILD UI
+-- ============================================================
+local function BuildUI()
+    local old=PlayerGui:FindFirstChild("XenoPiano2"); if old then old:Destroy() end
+
+    local sg=New("ScreenGui",{Name="XenoPiano2",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling},PlayerGui)
+
+    -- Janela
+    local win=New("Frame",{
+        Size=UDim2.new(0,450,0,600),
+        Position=UDim2.new(0.5,-225,0.5,-300),
+        BackgroundColor3=C(11,10,18),
+        Active=true,Draggable=true,ClipsDescendants=true,
+    },sg)
+    Corner(win,16); Stroke(win,C(45,40,78),1)
+
+    -- Linha neon topo
+    local neon=New("Frame",{Size=UDim2.new(1,0,0,2),BackgroundColor3=C(1,1,1),BorderSizePixel=0},win)
+    local ng=Instance.new("UIGradient")
+    ng.Color=ColorSequence.new({
+        ColorSequenceKeypoint.new(0,C(100,40,220)),
+        ColorSequenceKeypoint.new(0.5,C(40,200,220)),
+        ColorSequenceKeypoint.new(1,C(180,40,220)),
+    }); ng.Rotation=0; ng.Parent=neon
+
+    -- Header
+    local hdr=New("Frame",{Size=UDim2.new(1,0,0,52),Position=UDim2.new(0,0,0,2),BackgroundColor3=C(17,15,28),BorderSizePixel=0},win)
+    New("TextLabel",{
+        Size=UDim2.new(0,220,1,0),Position=UDim2.new(0,14,0,0),
+        BackgroundTransparency=1,Text="🎹  XenoPiano  V2",
+        TextColor3=C(215,205,255),Font=Enum.Font.GothamBold,TextSize=17,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },hdr)
+
+    XP.NoteLbl=New("TextLabel",{
+        Size=UDim2.new(0,68,0,26),Position=UDim2.new(1,-118,0.5,-13),
+        BackgroundColor3=C(22,20,36),Text="—",
+        TextColor3=C(155,155,195),Font=Enum.Font.GothamBold,TextSize=13,
+    },hdr); Corner(XP.NoteLbl,6); Stroke(XP.NoteLbl,C(42,38,68))
+
+    local closeBtn=Btn(hdr,"✕",C(90,26,26),{Size=UDim2.new(0,30,0,26),Position=UDim2.new(1,-40,0.5,-13),TextSize=13,_r=6})
+    closeBtn.MouseButton1Click:Connect(function() XP.StopFlag=true; ReleaseAll(); sg:Destroy() end)
+
+    -- Tabs
+    local tabBar=New("Frame",{Size=UDim2.new(1,-20,0,32),Position=UDim2.new(0,10,0,60),BackgroundTransparency=1},win)
+    New("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,5)},tabBar)
+
+    local tabDefs={{"📚 Biblioteca","library"},{"✏️ Custom","custom"},{"⚙️ Config","settings"}}
+    local tabBtns,pages={},{}
+    for _,d in ipairs(tabDefs) do
+        local p=New("Frame",{Size=UDim2.new(1,-20,1,-118),Position=UDim2.new(0,10,0,108),BackgroundTransparency=1,Visible=d[2]=="library"},win)
+        pages[d[2]]=p
+    end
+
+    local function SwitchTab(key)
+        for k,p in pairs(pages) do p.Visible=k==key end
+        for i,tb in ipairs(tabBtns) do
+            local active=tabDefs[i][2]==key
+            tb.BackgroundColor3=active and C(55,42,118) or C(24,22,40)
+            tb.TextColor3=active and C(220,210,255) or C(108,105,148)
+        end
+    end
+    for i,d in ipairs(tabDefs) do
+        local active=d[2]=="library"
+        local tb=Btn(tabBar,d[1],active and C(55,42,118) or C(24,22,40),{
+            Size=UDim2.new(0,132,1,0),TextSize=11,
+            TextColor3=active and C(220,210,255) or C(108,105,148),_r=7,
+        })
+        local k=d[2]; tb.MouseButton1Click:Connect(function() SwitchTab(k) end)
+        table.insert(tabBtns,tb)
+    end
+
+    -- ─────── BIBLIOTECA ──────────────────────────────────────
+    local libP=pages["library"]
+
+    local catSc=New("ScrollingFrame",{
+        Size=UDim2.new(1,0,0,30),BackgroundTransparency=1,
+        ScrollBarThickness=0,ScrollingDirection=Enum.ScrollingDirection.X,
+        CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.X,
+    },libP)
+    New("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,5)},catSc)
+
+    local sb=New("TextBox",{
+        Size=UDim2.new(1,0,0,30),Position=UDim2.new(0,0,0,36),
+        BackgroundColor3=C(18,18,30),Text="",
+        PlaceholderText="🔍  Buscar música...",PlaceholderColor3=C(70,68,105),
+        TextColor3=C(200,196,240),Font=Enum.Font.Gotham,TextSize=12,
+        ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,
+    },libP); Corner(sb,8); Stroke(sb,C(38,36,62)); Pad(sb,10,10)
+
+    local listSc=New("ScrollingFrame",{
+        Size=UDim2.new(1,0,1,-72),Position=UDim2.new(0,0,0,72),
+        BackgroundTransparency=1,ScrollBarThickness=3,
+        ScrollBarImageColor3=C(72,52,148),
+        CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,
+    },libP)
+    New("UIListLayout",{Padding=UDim.new(0,4)},listSc)
+
+    local activeCat="Todos"
+    local catBtnMap={}
+
+    local function PopSongs(cat,filter)
+        for _,b in pairs(XP.Buttons) do b:Destroy() end; XP.Buttons={}
+        local src=cat=="Todos" and AllSongs or (function()
+            for c,s in pairs(Songs) do if c==cat then return s end end; return AllSongs
+        end)()
+        local keys={}
+        for name in pairs(src) do
+            if filter=="" or name:lower():find(filter:lower(),1,true) then table.insert(keys,name) end
+        end
+        table.sort(keys)
+        if #keys==0 then
+            New("TextLabel",{Size=UDim2.new(1,0,0,36),BackgroundTransparency=1,
+                Text="Nenhuma música encontrada.",TextColor3=C(75,72,108),
+                Font=Enum.Font.Gotham,TextSize=12},listSc)
+            return
+        end
+        for _,name in ipairs(keys) do
+            local song=src[name]
+            local row=New("Frame",{Size=UDim2.new(1,-4,0,44),BackgroundColor3=C(19,18,30),BorderSizePixel=0},listSc)
+            Corner(row,8); Stroke(row,C(34,32,54))
+            -- info da song
+            local noteCount=#song.notes
+            New("TextLabel",{
+                Size=UDim2.new(1,-90,0,24),Position=UDim2.new(0,12,0,4),
+                BackgroundTransparency=1,Text=name,
+                TextColor3=C(195,190,238),Font=Enum.Font.GothamBold,TextSize=12,
+                TextXAlignment=Enum.TextXAlignment.Left,
+            },row)
+            New("TextLabel",{
+                Size=UDim2.new(1,-90,0,16),Position=UDim2.new(0,12,0,26),
+                BackgroundTransparency=1,
+                Text=string.format("BPM %d  •  %d notas  •  %.1fs", song.bpm or 0, noteCount,
+                    noteCount>0 and song.notes[noteCount].t or 0),
+                TextColor3=C(85,82,118),Font=Enum.Font.Gotham,TextSize=10,
+                TextXAlignment=Enum.TextXAlignment.Left,
+            },row)
+            local pb=Btn(row,"▶",C(44,34,108),{Size=UDim2.new(0,38,0,28),Position=UDim2.new(1,-46,0.5,-14),TextSize=14,_r=7})
+            pb.MouseButton1Click:Connect(function()
+                for _,b in pairs(XP.Buttons) do Tween(b,{BackgroundColor3=C(19,18,30)}) end
+                Tween(row,{BackgroundColor3=C(34,26,64)})
+                if XP.StatusLbl then XP.StatusLbl.Text="▶  "..name end
+                task.spawn(PlaySong,song)
+            end)
+            table.insert(XP.Buttons,row)
+        end
+    end
+
+    -- categorias
+    local catOrder={"Todos"}
+    for c in pairs(Songs) do table.insert(catOrder,c) end; table.sort(catOrder)
+    for _,cat in ipairs(catOrder) do
+        local active=cat=="Todos"
+        local cb=Btn(catSc,cat,active and C(48,38,108) or C(22,22,36),{
+            Size=UDim2.new(0,0,1,0),AutomaticSize=Enum.AutomaticSize.X,
+            TextSize=11,TextColor3=active and C(210,200,255) or C(110,108,150),_r=7,
+        })
+        Pad(cb,10,10)
+        catBtnMap[cat]=cb
+        cb.MouseButton1Click:Connect(function()
+            activeCat=cat
+            for c2,b2 in pairs(catBtnMap) do
+                b2.BackgroundColor3=c2==cat and C(48,38,108) or C(22,22,36)
+                b2.TextColor3=c2==cat and C(210,200,255) or C(110,108,150)
+            end
+            PopSongs(cat,sb.Text)
+        end)
+    end
+    sb:GetPropertyChangedSignal("Text"):Connect(function() PopSongs(activeCat,sb.Text) end)
+    PopSongs("Todos","")
+
+    -- ─────── CUSTOM SHEET ────────────────────────────────────
+    local cusP=pages["custom"]
+
+    New("TextLabel",{
+        Size=UDim2.new(1,0,0,16),BackgroundTransparency=1,
+        Text="Cole uma sheet de Virtual Piano (teclas do teclado):",
+        TextColor3=C(135,130,188),Font=Enum.Font.Gotham,TextSize=11,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },cusP)
+
+    local sheetBox=New("TextBox",{
+        Size=UDim2.new(1,0,1,-120),Position=UDim2.new(0,0,0,22),
+        BackgroundColor3=C(15,14,24),Text="",
+        PlaceholderText="Ex: q w e [qe] t y u | r _ t y",
+        PlaceholderColor3=C(60,58,90),TextColor3=C(190,195,235),
+        Font=Enum.Font.Code,TextSize=12,MultiLine=true,
+        TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,
+        TextYAlignment=Enum.TextYAlignment.Top,ClearTextOnFocus=false,
+    },cusP); Corner(sheetBox,8); Stroke(sheetBox,C(38,35,62))
+    Pad(sheetBox,10,10,8,8)
+
+    -- BPM da custom sheet
+    local bpmRow=New("Frame",{
+        Size=UDim2.new(1,0,0,32),Position=UDim2.new(0,0,1,-74),
+        BackgroundColor3=C(18,17,28),BorderSizePixel=0,
+    },cusP); Corner(bpmRow,8)
+    local customBPM=120
+    local bpmTxt=New("TextLabel",{
+        Size=UDim2.new(0.5,0,1,0),Position=UDim2.new(0,10,0,0),
+        BackgroundTransparency=1,Text="BPM: 120",
+        TextColor3=C(140,220,165),Font=Enum.Font.GothamBold,TextSize=12,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },bpmRow)
+    local bm=Btn(bpmRow,"−",C(30,28,48),{Size=UDim2.new(0,28,0,24),Position=UDim2.new(1,-62,0.5,-12),TextSize=15,_r=6})
+    local bp=Btn(bpmRow,"+",C(30,28,48),{Size=UDim2.new(0,28,0,24),Position=UDim2.new(1,-30,0.5,-12),TextSize=15,_r=6})
+    bm.MouseButton1Click:Connect(function() customBPM=math.max(40,customBPM-5); bpmTxt.Text="BPM: "..customBPM end)
+    bp.MouseButton1Click:Connect(function() customBPM=math.min(300,customBPM+5); bpmTxt.Text="BPM: "..customBPM end)
+
+    New("TextLabel",{
+        Size=UDim2.new(1,0,0,20),Position=UDim2.new(0,0,1,-38),
+        BackgroundTransparency=1,
+        Text="Teclas: a s d f g h j k  •  Acorde: [qwe]  •  Pausa: |  •  Silêncio: -",
+        TextColor3=C(68,65,100),Font=Enum.Font.Code,TextSize=10,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },cusP)
+
+    local pcBtn=Btn(cusP,"▶  Tocar Sheet",C(44,34,108),{
+        Size=UDim2.new(1,0,0,34),Position=UDim2.new(0,0,1,-34),TextSize=14,_r=9,
+    })
+    pcBtn.MouseButton1Click:Connect(function()
+        local s=sheetBox.Text:gsub("\n"," ")
+        if s:match("%S") then
+            local parsed=ParseSheet(s,customBPM)
+            if XP.StatusLbl then XP.StatusLbl.Text="▶  Custom ("..#parsed.notes.." notas)" end
+            task.spawn(PlaySong,parsed)
+        end
+    end)
+
+    -- ─────── CONFIG ──────────────────────────────────────────
+    local cfgP=pages["settings"]
+    New("UIListLayout",{Padding=UDim.new(0,8)},cfgP)
+
+    local function CfgRow(lbl,val,onM,onP)
+        local row=New("Frame",{Size=UDim2.new(1,0,0,50),BackgroundColor3=C(17,16,27)},cfgP)
+        Corner(row,10); Stroke(row,C(34,32,54))
+        New("TextLabel",{
+            Size=UDim2.new(0.58,0,0,20),Position=UDim2.new(0,12,0,6),
+            BackgroundTransparency=1,Text=lbl,
+            TextColor3=C(172,168,215),Font=Enum.Font.GothamBold,TextSize=12,
+            TextXAlignment=Enum.TextXAlignment.Left,
+        },row)
+        local vl=New("TextLabel",{
+            Size=UDim2.new(0,60,0,20),Position=UDim2.new(0,12,0,26),
+            BackgroundTransparency=1,Text=val,
+            TextColor3=C(90,225,150),Font=Enum.Font.GothamBold,TextSize=12,
+            TextXAlignment=Enum.TextXAlignment.Left,
+        },row)
+        local mb=Btn(row,"−",C(30,28,48),{Size=UDim2.new(0,28,0,28),Position=UDim2.new(1,-64,0.5,-14),TextSize=16,_r=6})
+        local pb2=Btn(row,"+",C(30,28,48),{Size=UDim2.new(0,28,0,28),Position=UDim2.new(1,-32,0.5,-14),TextSize=16,_r=6})
+        mb.MouseButton1Click:Connect(function() vl.Text=onM() end)
+        pb2.MouseButton1Click:Connect(function() vl.Text=onP() end)
+        return vl
+    end
+
+    -- Error Margin (principal diferencial do TALENTLESS)
+    XP.ErrLbl=CfgRow(
+        "Error Margin  (0 = perfeito, 100 = humano)","0",
+        function() XP.ErrorMargin=math.max(0,XP.ErrorMargin-5);   return tostring(XP.ErrorMargin) end,
+        function() XP.ErrorMargin=math.min(100,XP.ErrorMargin+5); return tostring(XP.ErrorMargin) end
+    )
+
+    -- Note Length Randomization
+    local nlRow=New("Frame",{Size=UDim2.new(1,0,0,50),BackgroundColor3=C(17,16,27)},cfgP)
+    Corner(nlRow,10); Stroke(nlRow,C(34,32,54))
+    New("TextLabel",{
+        Size=UDim2.new(0.7,0,0,22),Position=UDim2.new(0,12,0.5,-11),
+        BackgroundTransparency=1,Text="Note Length Randomization",
+        TextColor3=C(172,168,215),Font=Enum.Font.GothamBold,TextSize=12,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },nlRow)
+    local nlTgl=Btn(nlRow,"● ON",C(26,85,50),{
+        Size=UDim2.new(0,66,0,28),Position=UDim2.new(1,-76,0.5,-14),
+        TextColor3=C(130,255,165),TextSize=12,_r=7,
+    })
+    nlTgl.MouseButton1Click:Connect(function()
+        XP.NoteRand=not XP.NoteRand
+        nlTgl.Text=XP.NoteRand and "● ON" or "● OFF"
+        nlTgl.BackgroundColor3=XP.NoteRand and C(26,85,50) or C(85,26,26)
+        nlTgl.TextColor3=XP.NoteRand and C(130,255,165) or C(255,130,130)
+    end)
+
+    -- Explicação técnica
+    New("TextLabel",{
+        Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundColor3=C(15,14,24),TextColor3=C(88,85,128),
+        Font=Enum.Font.Code,TextSize=10,TextWrapped=true,
+        TextXAlignment=Enum.TextXAlignment.Left,
+        Text="Engine timestamp-based:\nCada nota tem um tempo absoluto (ex: t=1.250s desde o início).\nO scheduler acorda exatamente nesse instante em vez de\nencadear task.wait()s — acordes ficam perfeitamente sincronizados.\n\nError Margin: varia o timestamp de cada nota por um delta\naleatório. Quanto maior, mais humano e menos preciso.\n\nNote Rand: cada nota tem release time levemente diferente.",
+    },cfgP); Pad(cfgP:FindFirstChildWhichIsA("TextLabel"),8,8,8,8)
+
+    -- ─────── RODAPÉ ──────────────────────────────────────────
+    New("Frame",{Size=UDim2.new(1,-20,0,1),Position=UDim2.new(0,10,1,-46),BackgroundColor3=C(36,34,56),BorderSizePixel=0},win)
+
+    local foot=New("Frame",{Size=UDim2.new(1,-20,0,36),Position=UDim2.new(0,10,1,-41),BackgroundTransparency=1},win)
+
+    XP.StatusLbl=New("TextLabel",{
+        Size=UDim2.new(1,-100,1,0),BackgroundTransparency=1,
+        Text="Pronto.",TextColor3=C(85,82,118),
+        Font=Enum.Font.Gotham,TextSize=11,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },foot)
+
+    local stopBtn=Btn(foot,"⏹ STOP",C(115,30,30),{
+        Size=UDim2.new(0,90,1,0),Position=UDim2.new(1,-90,0,0),
+        TextColor3=C(255,180,180),TextSize=13,_r=9,
+    })
+    stopBtn.MouseButton1Click:Connect(function()
+        XP.StopFlag=true; ReleaseAll(); XP.Playing=false
+        if XP.StatusLbl then XP.StatusLbl.Text="⏹ Parado" end
+        if XP.NoteLbl   then XP.NoteLbl.Text="—" end
+    end)
+end
+
+-- ============================================================
+-- START
+-- ============================================================
+pcall(BuildUI)
+
+local total,cats=0,0
+for _ in pairs(AllSongs) do total=total+1 end
+for _ in pairs(Songs) do cats=cats+1 end
+print(string.format(
+    "✅ XenoPiano V2 — engine timestamp-based | %d músicas | %d cats | error margin | note rand",
+    total, cats
+))
